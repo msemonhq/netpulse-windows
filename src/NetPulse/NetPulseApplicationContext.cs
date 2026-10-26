@@ -4,279 +4,173 @@ namespace NetPulse;
 
 public sealed class NetPulseApplicationContext : ApplicationContext
 {
-    private readonly NetworkTrafficMonitor _monitor = new();
     private readonly SettingsStore _settingsStore = new();
-    private readonly ContextMenuStrip _menu = new();
-    private readonly ToolStripMenuItem _rateItem = new("Reading network traffic…") { Enabled = false };
-    private readonly ToolStripMenuItem _sessionItem = new("Session totals: collecting…") { Enabled = false };
-    private readonly ToolStripMenuItem _adapterStatusItem = new("Adapter: All active adapters") { Enabled = false };
-    private readonly ToolStripMenuItem _adapterMenu = new("Network adapter");
-    private readonly ToolStripMenuItem _startupItem = new("Launch at Windows sign-in");
-    private readonly System.Windows.Forms.Timer _timer;
+    private readonly AppSettings _settings;
+    private readonly ICounterSource _counterSource;
+    private readonly TrafficSampler _sampler;
     private readonly NotifyIcon _notifyIcon;
-    private AppSettings _settings;
-    private Icon? _currentIcon;
-    private TrafficCounters? _lastCounters;
-    private DateTimeOffset _lastSampleAt;
-    private double _downloadBytesPerSecond;
-    private double _uploadBytesPerSecond;
-    private long _sessionDownloaded;
-    private long _sessionUploaded;
-    private int _tickCount;
-    private bool _showDownloadInIcon = true;
+    private readonly ContextMenuStrip _menu = new();
+    private readonly System.Threading.Timer _timer;
+    private readonly ToolStripMenuItem _unitItem = new("Show speeds in Mbps");
+    private readonly ToolStripMenuItem _stripItem = new("Show taskbar-adjacent strip");
+    private readonly ToolStripMenuItem _startupItem = new("Launch at Windows sign-in");
+    private readonly SpeedWidget _widget;
+    private TaskbarStrip? _strip;
+    private int _sampling;
+    private bool _disposed;
 
     public NetPulseApplicationContext()
     {
         _settings = _settingsStore.Load();
+        _counterSource = new NetworkTrafficMonitor();
+        _sampler = new TrafficSampler(_counterSource);
 
-        _menu.Items.Add(_rateItem);
-        _menu.Items.Add(_sessionItem);
-        _menu.Items.Add(_adapterStatusItem);
-        _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(_adapterMenu);
+        _widget = new SpeedWidget(_settingsStore, _settings);
+        _widget.Show();
+        _widget.UpdateTraffic(new TrafficSample(0, 0, 0, 0, "Detecting network…", false), CurrentUnit());
+
+        _unitItem.Checked = _settings.UseMegabits;
+        _unitItem.Click += (_, _) =>
+        {
+            _settings.UseMegabits = !_settings.UseMegabits;
+            SaveSettings();
+            _unitItem.Checked = _settings.UseMegabits;
+        };
+        _menu.Items.Add(_unitItem);
+
+        _stripItem.Checked = _settings.ShowTaskbarStrip;
+        _stripItem.Click += (_, _) => ToggleStrip();
+        _menu.Items.Add(_stripItem);
+
         _startupItem.Checked = StartupRegistration.IsEnabled();
-        _startupItem.Click += ToggleStartup;
+        _startupItem.Click += (_, _) =>
+        {
+            try
+            {
+                StartupRegistration.SetEnabled(!_startupItem.Checked);
+                _startupItem.Checked = StartupRegistration.IsEnabled();
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or InvalidOperationException or System.Security.SecurityException)
+            {
+                MessageBox.Show($"Could not change startup setting.\n{ex.Message}", "NetPulse", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        };
         _menu.Items.Add(_startupItem);
 
-        var aboutItem = new ToolStripMenuItem("About NetPulse");
-        aboutItem.Click += (_, _) => MessageBox.Show(
-            "NetPulse\nA lightweight, local network traffic meter.\n\n" +
-            "The tray icon alternates between download and upload rates. " +
-            "Hover over it to see both readings.",
-            "About NetPulse",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Information);
-        _menu.Items.Add(aboutItem);
-
+        var showItem = new ToolStripMenuItem("Show speed widget");
+        showItem.Click += (_, _) => { _widget.Show(); _widget.Activate(); };
+        _menu.Items.Add(showItem);
+        var settingsItem = new ToolStripMenuItem("Settings");
+        settingsItem.Click += (_, _) => ShowSettings();
+        _menu.Items.Add(settingsItem);
+        _menu.Items.Add(new ToolStripSeparator());
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, _) => ExitThread();
         _menu.Items.Add(exitItem);
 
-        _menu.Opening += (_, _) => RebuildAdapterMenu();
-
-        _currentIcon = TrayIconRenderer.CreateIcon(0, isDownload: true);
         _notifyIcon = new NotifyIcon
         {
-            Icon = _currentIcon,
-            Text = "NetPulse: starting",
+            Icon = SystemIcons.Information,
+            Text = "NetPulse — starting",
             ContextMenuStrip = _menu,
             Visible = true
         };
+        _notifyIcon.DoubleClick += (_, _) => { _widget.Show(); _widget.Activate(); };
+        if (_settings.ShowTaskbarStrip) ShowStrip();
 
-        _timer = new System.Windows.Forms.Timer { Interval = 1000 };
-        _timer.Tick += (_, _) => UpdateMetrics();
-        _timer.Start();
-        UpdateMetrics();
+        _timer = new System.Threading.Timer(_ => SampleOffUiThread(), null, TimeSpan.Zero, TimeSpan.FromSeconds(1));
     }
 
-    private void UpdateMetrics()
-    {
-        var now = DateTimeOffset.UtcNow;
+    private SpeedUnit CurrentUnit() => _settings.UseMegabits
+        ? SpeedUnit.MegabitsPerSecond : SpeedUnit.MegabytesPerSecond;
 
+    private void SampleOffUiThread()
+    {
+        if (Interlocked.Exchange(ref _sampling, 1) != 0) return;
         try
         {
-            if (!_monitor.TryReadCounters(_settings.SelectedAdapterId, out var current))
+            var sample = _sampler.Sample();
+            if (_disposed) return;
+            _widget.BeginInvoke(new Action(() =>
             {
-                // Clear the baseline while offline so reconnection does not create a spike.
-                _lastCounters = null;
-                _lastSampleAt = now;
-                _downloadBytesPerSecond = 0;
-                _uploadBytesPerSecond = 0;
-                RefreshDisplay();
-                return;
-            }
-
-            if (_lastCounters is { } previous)
-            {
-                var elapsed = now - _lastSampleAt;
-                var receivedDelta = TrafficRateCalculator.GetDeltaBytes(
-                    current.BytesReceived, previous.BytesReceived);
-                var sentDelta = TrafficRateCalculator.GetDeltaBytes(
-                    current.BytesSent, previous.BytesSent);
-
-                _downloadBytesPerSecond = TrafficRateCalculator.GetBytesPerSecond(receivedDelta, elapsed);
-                _uploadBytesPerSecond = TrafficRateCalculator.GetBytesPerSecond(sentDelta, elapsed);
-                _sessionDownloaded = SaturatingAdd(_sessionDownloaded, receivedDelta);
-                _sessionUploaded = SaturatingAdd(_sessionUploaded, sentDelta);
-            }
-            else
-            {
-                // The first sample is a baseline, not an amount transferred during this session.
-                _downloadBytesPerSecond = 0;
-                _uploadBytesPerSecond = 0;
-            }
-
-            _lastCounters = current;
-            _lastSampleAt = now;
-            _tickCount++;
-            _showDownloadInIcon = _tickCount % 2 == 0;
-            RefreshDisplay();
+                if (_disposed) return;
+                _widget.UpdateTraffic(sample, CurrentUnit());
+                if (_strip is { IsDisposed: false }) _strip.UpdateTraffic(sample, CurrentUnit());
+                _notifyIcon.Text = $"↓ {RateFormatter.FormatRate(sample.DownloadBytesPerSecond, CurrentUnit())} ↑ {RateFormatter.FormatRate(sample.UploadBytesPerSecond, CurrentUnit())}";
+            }));
         }
         catch (Exception)
         {
-            // A transient driver or adapter error must not close the tray app.
-            _lastCounters = null;
-            _downloadBytesPerSecond = 0;
-            _uploadBytesPerSecond = 0;
-            _notifyIcon.Text = "NetPulse: network counters unavailable";
-            RefreshDisplay();
+            if (!_disposed)
+            {
+                try { _widget.BeginInvoke(new Action(() => { if (!_disposed) _notifyIcon.Text = "NetPulse — counters unavailable"; })); }
+                catch (InvalidOperationException) { }
+            }
         }
+        finally { Volatile.Write(ref _sampling, 0); }
     }
 
-    private void RefreshDisplay()
+    private void ToggleStrip()
     {
-        _rateItem.Text =
-            $"↓ Download: {RateFormatter.FormatRate(_downloadBytesPerSecond)}    " +
-            $"↑ Upload: {RateFormatter.FormatRate(_uploadBytesPerSecond)}";
-        _sessionItem.Text =
-            $"Session: ↓ {RateFormatter.FormatTotal(_sessionDownloaded)}  ↑ {RateFormatter.FormatTotal(_sessionUploaded)}";
-        _adapterStatusItem.Text = $"Adapter: {GetSelectedAdapterLabel()}";
-
-        // NotifyIcon.Text is limited to 63 characters by Windows Forms.
-        _notifyIcon.Text =
-            $"↓ {RateFormatter.FormatRate(_downloadBytesPerSecond)}  ↑ {RateFormatter.FormatRate(_uploadBytesPerSecond)}";
-
-        var visibleRate = _showDownloadInIcon
-            ? _downloadBytesPerSecond
-            : _uploadBytesPerSecond;
-        var replacement = TrayIconRenderer.CreateIcon(visibleRate, _showDownloadInIcon);
-        var previousIcon = _currentIcon;
-        _currentIcon = replacement;
-        _notifyIcon.Icon = replacement;
-        previousIcon?.Dispose();
+        _settings.ShowTaskbarStrip = !_settings.ShowTaskbarStrip;
+        _stripItem.Checked = _settings.ShowTaskbarStrip;
+        if (_settings.ShowTaskbarStrip) ShowStrip();
+        else { _strip?.Close(); _strip?.Dispose(); _strip = null; }
+        SaveSettings();
     }
 
-    private void RebuildAdapterMenu()
+    private void ShowStrip()
     {
-        foreach (ToolStripItem item in _adapterMenu.DropDownItems)
-        {
-            item.Dispose();
-        }
+        if (_strip is { IsDisposed: false }) return;
+        _strip = new TaskbarStrip();
+        _strip.Show();
+    }
 
-        _adapterMenu.DropDownItems.Clear();
-
-        var allAdapters = new ToolStripMenuItem("All active adapters")
+    private void ShowSettings()
+    {
+        using var form = new Form
         {
-            Checked = _settings.SelectedAdapterId is null
+            Text = "NetPulse Settings",
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterScreen,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = true,
+            ClientSize = new Size(330, 150)
         };
-        allAdapters.Click += (_, _) => SelectAdapter(null);
-        _adapterMenu.DropDownItems.Add(allAdapters);
-
-        var adapters = _monitor.GetAdapters();
-        if (adapters.Count == 0)
+        var unit = new CheckBox { Text = "Display speeds in Mbps (instead of MB/s)", AutoSize = true, Left = 16, Top = 18, Checked = _settings.UseMegabits };
+        var strip = new CheckBox { Text = "Show taskbar-adjacent speed strip", AutoSize = true, Left = 16, Top = 50, Checked = _settings.ShowTaskbarStrip };
+        var close = new Button { Text = "Save", DialogResult = DialogResult.OK, Left = 238, Top = 104, Width = 75 };
+        form.Controls.AddRange([unit, strip, close]);
+        form.AcceptButton = close;
+        if (form.ShowDialog() == DialogResult.OK)
         {
-            _adapterMenu.DropDownItems.Add(new ToolStripMenuItem("No network adapters found")
-            {
-                Enabled = false
-            });
-            return;
-        }
-
-        _adapterMenu.DropDownItems.Add(new ToolStripSeparator());
-
-        foreach (var adapter in adapters)
-        {
-            var status = adapter.Status == OperationalStatus.Up ? string.Empty : " (disconnected)";
-            var label = Truncate($"{adapter.Name}{status}", 42);
-            var item = new ToolStripMenuItem(label)
-            {
-                Checked = string.Equals(
-                    _settings.SelectedAdapterId, adapter.Id, StringComparison.Ordinal)
-            };
-            var adapterId = adapter.Id;
-            item.Click += (_, _) => SelectAdapter(adapterId);
-            _adapterMenu.DropDownItems.Add(item);
+            _settings.UseMegabits = unit.Checked;
+            if (_settings.ShowTaskbarStrip != strip.Checked) ToggleStrip();
+            _unitItem.Checked = _settings.UseMegabits;
+            SaveSettings();
         }
     }
 
-    private void SelectAdapter(string? adapterId)
+    private void SaveSettings()
     {
-        if (string.Equals(_settings.SelectedAdapterId, adapterId, StringComparison.Ordinal))
+        try { _settingsStore.Save(_settings); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return;
+            MessageBox.Show($"Could not save settings.\n{ex.Message}", "NetPulse", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
-
-        var previousAdapterId = _settings.SelectedAdapterId;
-        _settings.SelectedAdapterId = adapterId;
-
-        try
-        {
-            _settingsStore.Save(_settings);
-        }
-        catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException or InvalidOperationException)
-        {
-            _settings.SelectedAdapterId = previousAdapterId;
-            MessageBox.Show(
-                $"NetPulse could not save this preference.\n\n{exception.Message}",
-                "NetPulse",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Warning);
-            return;
-        }
-
-        // New adapter counters establish a fresh baseline to avoid a false speed spike.
-        _lastCounters = null;
-        _downloadBytesPerSecond = 0;
-        _uploadBytesPerSecond = 0;
-        RefreshDisplay();
-    }
-
-    private void ToggleStartup(object? sender, EventArgs e)
-    {
-        var enable = !_startupItem.Checked;
-
-        try
-        {
-            StartupRegistration.SetEnabled(enable);
-            _startupItem.Checked = enable;
-        }
-        catch (Exception exception) when (
-            exception is UnauthorizedAccessException or InvalidOperationException or System.Security.SecurityException)
-        {
-            MessageBox.Show(
-                $"NetPulse could not update the Windows sign-in setting.\n\n{exception.Message}",
-                "NetPulse",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Warning);
-        }
-    }
-
-    private string GetSelectedAdapterLabel()
-    {
-        if (_settings.SelectedAdapterId is null)
-        {
-            return "All active adapters";
-        }
-
-        var adapter = _monitor.GetAdapters().FirstOrDefault(item =>
-            string.Equals(item.Id, _settings.SelectedAdapterId, StringComparison.Ordinal));
-
-        return adapter is null ? "Selected adapter (not found)" : adapter.Name;
-    }
-
-    private static string Truncate(string value, int maxLength) =>
-        value.Length <= maxLength ? value : value[..(maxLength - 1)] + "…";
-
-    private static long SaturatingAdd(long current, long delta)
-    {
-        if (delta <= 0)
-        {
-            return current;
-        }
-
-        return current > long.MaxValue - delta ? long.MaxValue : current + delta;
     }
 
     protected override void ExitThreadCore()
     {
-        _timer.Stop();
+        _disposed = true;
         _timer.Dispose();
+        _strip?.Close();
+        _strip?.Dispose();
+        _widget.Dispose();
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
         _menu.Dispose();
-        _currentIcon?.Dispose();
-        _currentIcon = null;
         base.ExitThreadCore();
     }
 }
