@@ -91,13 +91,13 @@ public sealed class NetPulseApplicationContext : ApplicationContext
         {
             var sample = _sampler.Sample();
             if (_disposed) return;
-            _widget.BeginInvoke(() =>
+            _widget.BeginInvoke(new Action(() =>
             {
                 if (_disposed) return;
                 _widget.UpdateTraffic(sample, CurrentUnit());
                 if (_strip is { IsDisposed: false }) _strip.UpdateTraffic(sample, CurrentUnit());
                 _notifyIcon.Text = $"↓ {RateFormatter.FormatRate(sample.DownloadBytesPerSecond, CurrentUnit())} ↑ {RateFormatter.FormatRate(sample.UploadBytesPerSecond, CurrentUnit())}";
-            });
+            }));
         }
         catch (Exception)
         {
