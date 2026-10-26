@@ -1,4 +1,5 @@
 using NetPulse;
+using Xunit;
 
 namespace NetPulse.Tests;
 
