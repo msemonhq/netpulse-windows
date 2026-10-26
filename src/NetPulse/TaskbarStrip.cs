@@ -1,6 +1,8 @@
+using Microsoft.Win32;
+
 namespace NetPulse;
 
-/// <summary>A compact optional always-on-top strip; Windows does not expose arbitrary taskbar controls to ordinary apps.</summary>
+/// <summary>A compact optional always-on-top strip adjacent to the taskbar.</summary>
 public sealed class TaskbarStrip : Form
 {
     private readonly Label _rates = new();
@@ -25,20 +27,20 @@ public sealed class TaskbarStrip : Form
 
     public void UpdateTraffic(TrafficSample sample, SpeedUnit unit)
     {
-        if (InvokeRequired) { BeginInvoke(() => UpdateTraffic(sample, unit)); return; }
+        if (InvokeRequired) { BeginInvoke(new Action(() => UpdateTraffic(sample, unit))); return; }
         _rates.Text = $"↓ {RateFormatter.FormatRate(sample.DownloadBytesPerSecond, unit)}   ↑ {RateFormatter.FormatRate(sample.UploadBytesPerSecond, unit)}";
     }
 
     private void OnDisplaySettingsChanged(object? sender, EventArgs e)
     {
-        if (!IsDisposed) BeginInvoke(PositionOverTaskbar);
+        if (!IsDisposed) BeginInvoke(new Action(PositionOverTaskbar));
     }
 
     private void PositionOverTaskbar()
     {
         var area = Screen.PrimaryScreen?.WorkingArea;
         if (area is null) return;
-        // Adjacent to the taskbar rather than embedded inside Explorer's private taskbar surface.
+        // Adjacent to the taskbar; Windows does not support embedding arbitrary controls into Explorer's taskbar.
         Location = new Point(area.Value.Right - Width - 8, area.Value.Bottom);
     }
 }
