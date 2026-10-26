@@ -1,99 +1,69 @@
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 
 namespace NetPulse;
 
-public sealed record NetworkAdapterInfo(
-    string Id,
-    string Name,
-    string Description,
-    OperationalStatus Status,
-    NetworkInterfaceType Type,
-    long SpeedBitsPerSecond);
-
-public readonly record struct TrafficCounters(long BytesReceived, long BytesSent);
-
-/// <summary>
-/// Reads Windows network-interface counters. It deliberately does not generate
-/// traffic or contact an external speed-test service.
-/// </summary>
-public sealed class NetworkTrafficMonitor
+/// <summary>Reads interface counters and caches adapter metadata. No network requests are made.</summary>
+public sealed class NetworkTrafficMonitor : ICounterSource
 {
-    public IReadOnlyList<NetworkAdapterInfo> GetAdapters()
-    {
-        return NetworkInterface.GetAllNetworkInterfaces()
-            .Where(IsSupported)
-            .Select(adapter => new NetworkAdapterInfo(
-                adapter.Id,
-                string.IsNullOrWhiteSpace(adapter.Name) ? adapter.Description : adapter.Name,
-                adapter.Description,
-                adapter.OperationalStatus,
-                adapter.NetworkInterfaceType,
-                adapter.Speed))
-            .OrderBy(adapter => adapter.Name, StringComparer.CurrentCultureIgnoreCase)
-            .ToArray();
-    }
+    private readonly TimeSpan _refreshInterval;
+    private DateTimeOffset _lastRefresh;
+    private IReadOnlyList<AdapterMetadata> _cached = Array.Empty<AdapterMetadata>();
 
-    /// <summary>
-    /// Reads either one selected adapter or all active non-loopback, non-tunnel
-    /// adapters. Returns false when no eligible adapter can be sampled.
-    /// </summary>
-    public bool TryReadCounters(string? selectedAdapterId, out TrafficCounters counters)
-    {
-        long received = 0;
-        long sent = 0;
-        var found = false;
+    public NetworkTrafficMonitor(TimeSpan? refreshInterval = null) =>
+        _refreshInterval = refreshInterval ?? TimeSpan.FromSeconds(5);
 
-        foreach (var adapter in NetworkInterface.GetAllNetworkInterfaces())
+    public IReadOnlyList<AdapterSnapshot> ReadAdapters()
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (_cached.Count == 0 || now - _lastRefresh >= _refreshInterval) RefreshAdapterCache(now);
+
+        var snapshots = new List<AdapterSnapshot>(_cached.Count);
+        foreach (var adapter in _cached)
         {
-            if (!IsSupported(adapter))
-            {
-                continue;
-            }
-
-            if (selectedAdapterId is not null &&
-                !string.Equals(adapter.Id, selectedAdapterId, StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            // For the aggregate view, only count interfaces that are currently up.
-            if (adapter.OperationalStatus != OperationalStatus.Up)
-            {
-                continue;
-            }
-
             try
             {
-                var statistics = adapter.GetIPStatistics();
-                received = SaturatingAdd(received, statistics.BytesReceived);
-                sent = SaturatingAdd(sent, statistics.BytesSent);
-                found = true;
+                var current = NetworkInterface.GetAllNetworkInterfaces()
+                    .FirstOrDefault(x => string.Equals(x.Id, adapter.Id, StringComparison.Ordinal));
+                if (current is null) continue;
+                var up = current.OperationalStatus == OperationalStatus.Up;
+                long received = 0, sent = 0;
+                if (up)
+                {
+                    var stats = current.GetIPStatistics();
+                    received = Math.Max(0, stats.BytesReceived);
+                    sent = Math.Max(0, stats.BytesSent);
+                }
+                snapshots.Add(new AdapterSnapshot(adapter.Id, adapter.Name, up, adapter.HasDefaultGateway, received, sent));
             }
-            catch (NetworkInformationException)
-            {
-                // A transient adapter state should not terminate the tray app.
-            }
-            catch (NotSupportedException)
-            {
-                // Some virtual adapters do not expose all counters.
-            }
+            catch (NetworkInformationException) { }
+            catch (NotSupportedException) { }
+            catch (InvalidOperationException) { }
         }
-
-        counters = found ? new TrafficCounters(received, sent) : default;
-        return found;
+        return snapshots;
     }
 
-    private static bool IsSupported(NetworkInterface adapter) =>
-        adapter.NetworkInterfaceType is not NetworkInterfaceType.Loopback
-            and not NetworkInterfaceType.Tunnel;
-
-    private static long SaturatingAdd(long current, long amount)
+    private void RefreshAdapterCache(DateTimeOffset now)
     {
-        if (amount <= 0)
+        var metadata = new List<AdapterMetadata>();
+        foreach (var adapter in NetworkInterface.GetAllNetworkInterfaces())
         {
-            return current;
+            if (adapter.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel) continue;
+            bool hasGateway = false;
+            try
+            {
+                hasGateway = adapter.GetIPProperties().GatewayAddresses.Any(g =>
+                    (g.Address.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6) &&
+                    !g.Address.Equals(System.Net.IPAddress.Any) &&
+                    !g.Address.Equals(System.Net.IPAddress.IPv6Any));
+            }
+            catch (NetworkInformationException) { }
+            metadata.Add(new AdapterMetadata(adapter.Id,
+                string.IsNullOrWhiteSpace(adapter.Name) ? adapter.Description : adapter.Name, hasGateway));
         }
-
-        return current > long.MaxValue - amount ? long.MaxValue : current + amount;
+        _cached = metadata;
+        _lastRefresh = now;
     }
+
+    private sealed record AdapterMetadata(string Id, string Name, bool HasDefaultGateway);
 }
