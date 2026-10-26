@@ -1,0 +1,16 @@
+# Build output
+**/bin/
+**/obj/
+artifacts/
+publish/
+
+# User and IDE files
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Local app settings
+settings.local.json
