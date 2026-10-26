@@ -62,7 +62,7 @@ public sealed class SpeedWidget : Form
     public void UpdateTraffic(TrafficSample sample, SpeedUnit unit)
     {
         if (IsDisposed) return;
-        if (InvokeRequired) { BeginInvoke(() => UpdateTraffic(sample, unit)); return; }
+        if (InvokeRequired) { BeginInvoke(new Action(() => UpdateTraffic(sample, unit))); return; }
         _download.Text = $"↓  {RateFormatter.FormatRate(sample.DownloadBytesPerSecond, unit)}";
         _upload.Text = $"↑  {RateFormatter.FormatRate(sample.UploadBytesPerSecond, unit)}";
         _header.Text = sample.IsConnected ? $"NETPULSE  ·  {sample.PreferredAdapterName}" : "NETPULSE  ·  Offline";
