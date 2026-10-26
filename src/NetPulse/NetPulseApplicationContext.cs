@@ -103,7 +103,7 @@ public sealed class NetPulseApplicationContext : ApplicationContext
         {
             if (!_disposed)
             {
-                try { _widget.BeginInvoke(() => { if (!_disposed) _notifyIcon.Text = "NetPulse — counters unavailable"; }); }
+                try { _widget.BeginInvoke(new Action(() => { if (!_disposed) _notifyIcon.Text = "NetPulse — counters unavailable"; })); }
                 catch (InvalidOperationException) { }
             }
         }
